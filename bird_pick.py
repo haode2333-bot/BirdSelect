@@ -37,7 +37,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from toolpaths import find_exiftool, resolve_model_paths
+from toolpaths import find_exiftool, resolve_model_paths, no_window_flags
 
 
 # ---------- 工具函数 ----------
@@ -97,6 +97,7 @@ def extract_preview(cr3_path: Path, out_dir: Path) -> Path | None:
                 [exif, "-b", f"-{tag}", str(cr3_path)],
                 capture_output=True,
                 timeout=EXIFTOOL_TIMEOUT,
+                creationflags=no_window_flags(),
             )
         except subprocess.TimeoutExpired:
             print(f"[TIMEOUT] exiftool 提取超时: {cr3_path.name}", flush=True)

@@ -29,6 +29,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from toolpaths import no_window_flags
+
 
 # ---------- EXIF 读取 ----------
 
@@ -50,7 +52,8 @@ def read_exif(path: Path) -> dict:
         str(path),
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                           creationflags=no_window_flags())
     except subprocess.TimeoutExpired:
         return {}
     if r.returncode != 0 or not r.stdout.strip():

@@ -34,7 +34,7 @@ from PIL import Image, ImageTk
 # 同目录模块
 from bird_guide import BirdGuide, get_guide
 from exif_rename import read_exif, format_datetime, build_new_name
-from toolpaths import find_exiftool, resolve_model_paths
+from toolpaths import find_exiftool, resolve_model_paths, no_window_flags
 
 
 # ---------- 全局配置 ----------
@@ -97,6 +97,7 @@ def extract_cr3_preview(cr3_path: Path, out_dir: Path) -> Path | None:
                 [exif, "-b", f"-{tag}", str(cr3_path)],
                 capture_output=True,
                 timeout=60,
+                creationflags=no_window_flags(),
             )
         except subprocess.TimeoutExpired:
             break
@@ -323,7 +324,8 @@ class BirdApp(ctk.CTk):
             env["PYTHONUTF8"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         text=True, encoding="utf-8", errors="replace", env=env)
+                                         text=True, encoding="utf-8", errors="replace", env=env,
+                                         creationflags=no_window_flags())
             for line in self.proc.stdout:
                 line = line.rstrip()
                 m = re.match(r"\[PROGRESS\]\s+(\d+)/(\d+)", line)

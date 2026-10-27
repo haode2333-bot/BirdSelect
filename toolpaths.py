@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -52,3 +53,14 @@ def resolve_model_paths() -> tuple[Path, Path]:
     appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
     cfg_models = Path(appdata) / ".snipe" / "models"
     return cfg_models / "yolo26x-seg.onnx", cfg_models / "classifier.onnx"
+
+
+def no_window_flags() -> int:
+    """Windows 下返回 CREATE_NO_WINDOW，防止调用 exiftool 等控制台程序时弹黑窗。
+
+    GUI（pythonw.exe，无控制台）里 subprocess 调用控制台子系统 exe 时，
+    不加这个标志会为每次调用新建一个 cmd 窗口，批量处理时会疯狂弹窗。
+    """
+    if os.name == "nt":
+        return subprocess.CREATE_NO_WINDOW  # 0x08000000
+    return 0
