@@ -18,6 +18,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
+from toolpaths import app_dir
+
 
 @dataclass
 class BirdGuideEntry:
@@ -35,7 +37,7 @@ class BirdGuideEntry:
         """返回图鉴图绝对路径，不存在则 None。"""
         if not self.gallery_file:
             return None
-        p = Path(__file__).parent / "data" / "gallery" / self.gallery_file
+        p = app_dir() / "data" / "gallery" / self.gallery_file
         return p if p.exists() else None
 
     def has_gallery_image(self) -> bool:
@@ -47,7 +49,7 @@ class BirdGuide:
 
     def __init__(self, csv_path: Optional[Path] = None):
         if csv_path is None:
-            csv_path = Path(__file__).parent / "data" / "bird_taxonomy.csv"
+            csv_path = app_dir() / "data" / "bird_taxonomy.csv"
         self.csv_path = csv_path
         self._by_zh: dict[str, BirdGuideEntry] = {}
         self._by_latin: dict[str, BirdGuideEntry] = {}

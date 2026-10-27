@@ -34,12 +34,12 @@ from PIL import Image, ImageTk
 # 同目录模块
 from bird_guide import BirdGuide, get_guide
 from exif_rename import read_exif, format_datetime, build_new_name
-from toolpaths import find_exiftool, resolve_model_paths, no_window_flags
+from toolpaths import app_dir, find_exiftool, resolve_model_paths, no_window_flags
 
 
 # ---------- 全局配置 ----------
 
-APP_DIR = Path(__file__).parent.resolve()
+APP_DIR = app_dir()
 DATA_DIR = APP_DIR / "data"
 GALLERY_DIR = DATA_DIR / "gallery"
 SETTINGS_FILE = APP_DIR / "settings.json"
