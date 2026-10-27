@@ -150,6 +150,26 @@ def load_ctk_image(path: Path, max_w: int, max_h: int) -> ctk.CTkImage | None:
 
 # ---------- 主窗口 ----------
 
+class _LineStream:
+    """按行转发 stdout（冻结模式下用 redirect_stdout 捕获 bird_pick 的进度输出）。"""
+
+    def __init__(self, on_line):
+        self._buf = ""
+        self._on_line = on_line
+
+    def write(self, s):
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._on_line(line.rstrip("\r"))
+        return len(s)
+
+    def flush(self):
+        if self._buf:
+            self._on_line(self._buf.rstrip("\r"))
+            self._buf = ""
+
+
 class BirdApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -323,56 +343,81 @@ class BirdApp(ctk.CTk):
         t.start()
 
     def _run_batch(self, scan_dir: str, out_dir: str):
+        # 拼好 bird_pick 的 CLI 参数（subprocess 和冻结进程内两种方式共用）
+        argv = [
+            "--scan-dir", scan_dir,
+            "--output-dir", out_dir,
+            "--top-n", str(self.settings["top_n"]),
+            "--conf-threshold", str(self.settings["conf_threshold"]),
+            "--region", self.settings["region"],
+            "--sharp-weight", str(self.settings["sharp_weight"]),
+            "--exposure-weight", str(self.settings["exposure_weight"]),
+            "--area-weight", str(self.settings["area_weight"]),
+            "--resume",
+            "--gui",
+        ]
+        if self.settings.get("multi_bird"):
+            argv.append("--multi-bird")
+        if self.settings.get("classify_all"):
+            argv.append("--classify-all")
+
+        def handle_line(line: str):
+            line = line.rstrip()
+            if not line:
+                return
+            m = re.match(r"\[PROGRESS\]\s+(\d+)/(\d+)", line)
+            if m:
+                cur, tot = int(m.group(1)), int(m.group(2))
+                self.after(0, lambda c=cur, t=tot: self._update_progress(c, t, "识别"))
+                return
+            m2 = re.match(r"\[COPY\]\s+(\d+)/(\d+)", line)
+            if m2:
+                cur, tot = int(m2.group(1)), int(m2.group(2))
+                self.after(0, lambda c=cur, t=tot: self._update_progress(c, t, "复制"))
+                return
+            self._log(line)
+
         try:
-            # 调 bird_pick.py 的核心逻辑（通过 subprocess 最稳）
-            cmd = [
-                sys.executable, str(APP_DIR / "bird_pick.py"),
-                "--scan-dir", scan_dir,
-                "--output-dir", out_dir,
-                "--top-n", str(self.settings["top_n"]),
-                "--conf-threshold", str(self.settings["conf_threshold"]),
-                "--region", self.settings["region"],
-                "--sharp-weight", str(self.settings["sharp_weight"]),
-                "--exposure-weight", str(self.settings["exposure_weight"]),
-                "--area-weight", str(self.settings["area_weight"]),
-                "--resume",
-                "--gui",
-            ]
-            if self.settings.get("multi_bird"):
-                cmd.append("--multi-bird")
-            if self.settings.get("classify_all"):
-                cmd.append("--classify-all")
-            self._log(f"执行: {' '.join(cmd)}")
-            # 强制子进程用 UTF-8 输出（Windows 下 pipe 默认 GBK，会跟 utf-8 解码冲突）
-            env = dict(os.environ)
-            env["PYTHONUTF8"] = "1"
-            env["PYTHONIOENCODING"] = "utf-8"
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         text=True, encoding="utf-8", errors="replace", env=env,
-                                         creationflags=no_window_flags())
-            for line in self.proc.stdout:
-                line = line.rstrip()
-                m = re.match(r"\[PROGRESS\]\s+(\d+)/(\d+)", line)
-                if m:
-                    cur, tot = int(m.group(1)), int(m.group(2))
-                    self.after(0, lambda c=cur, t=tot: self._update_progress(c, t, "识别"))
-                    continue
-                m2 = re.match(r"\[COPY\]\s+(\d+)/(\d+)", line)
-                if m2:
-                    cur, tot = int(m2.group(1)), int(m2.group(2))
-                    self.after(0, lambda c=cur, t=tot: self._update_progress(c, t, "复制"))
-                    continue
-                self._log(line)
-            self.proc.wait()
-            code = self.proc.returncode
-            if code == 0:
-                self._log("\n完成，退出码 0")
+            if getattr(sys, "frozen", False):
+                # 冻结版（exe）：bird_pick 已打进 exe，必须进程内调用。
+                # 用 sys.executable + bird_pick.py 会再启动一个 GUI（就是「弹另一个界面」的原因）。
+                self._log(f"执行: BirdSelect {' '.join(argv)}")
+                import bird_pick
+                import contextlib
+                stream = _LineStream(handle_line)
+                old_argv = sys.argv
+                sys.argv = ["bird_pick"] + argv
+                try:
+                    with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+                        bird_pick.main()
+                except SystemExit:
+                    pass
+                finally:
+                    sys.argv = old_argv
+                self._log("\n完成")
                 self.after(0, lambda: messagebox.showinfo("完成", f"扫描完成，结果在:\n{out_dir}"))
-            elif getattr(self, "_cancelled", False):
-                self._log("\n已取消扫描。")
             else:
-                self._log(f"\n扫描异常结束，退出码 {code}")
-                self.after(0, lambda: messagebox.showerror("错误", f"扫描异常结束，退出码 {code}"))
+                # 开发版/便携版：subprocess 调 bird_pick.py（最稳，能独立取消）
+                cmd = [sys.executable, str(APP_DIR / "bird_pick.py")] + argv
+                self._log(f"执行: {' '.join(cmd)}")
+                env = dict(os.environ)
+                env["PYTHONUTF8"] = "1"
+                env["PYTHONIOENCODING"] = "utf-8"
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                             text=True, encoding="utf-8", errors="replace", env=env,
+                                             creationflags=no_window_flags())
+                for line in self.proc.stdout:
+                    handle_line(line)
+                self.proc.wait()
+                code = self.proc.returncode
+                if code == 0:
+                    self._log("\n完成，退出码 0")
+                    self.after(0, lambda: messagebox.showinfo("完成", f"扫描完成，结果在:\n{out_dir}"))
+                elif getattr(self, "_cancelled", False):
+                    self._log("\n已取消扫描。")
+                else:
+                    self._log(f"\n扫描异常结束，退出码 {code}")
+                    self.after(0, lambda: messagebox.showerror("错误", f"扫描异常结束，退出码 {code}"))
         except Exception as e:
             self._log(f"错误: {e}")
             self.after(0, lambda: messagebox.showerror("错误", str(e)))
