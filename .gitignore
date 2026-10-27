@@ -1,0 +1,26 @@
+# 虚拟环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 运行时生成的临时/个人文件
+.tmp_preview/
+settings.json
+*.log
+startup_error.log
+
+# 第三方二进制与模型（不进 git，见 README / Releases）
+exiftool/
+models/
+snipe-data/
+
+# 打包产物
+build/
+dist/
+*.zip
+*.spec
+
+# 系统杂项
+.DS_Store
+Thumbs.db
