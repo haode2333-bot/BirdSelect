@@ -18,6 +18,7 @@ bird_desktop.py — 观鸟影像本地处理桌面工具
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -55,6 +56,7 @@ DEFAULT_SETTINGS = {
     "area_weight": 0.2,         # 画质评分：鸟体占比权重
     "multi_bird": False,        # 一张图多种鸟时是否各归一类
     "classify_all": False,      # 只分类不精选（不按 Top N 筛选）
+    "use_gpu": True,            # 是否启用 GPU 加速（关闭则强制 CPU）
 }
 
 REGIONS = {
@@ -111,7 +113,16 @@ def extract_cr3_preview(cr3_path: Path, out_dir: Path) -> Path | None:
     注意：exiftool 提取二进制 tag 必须用 stdout 重定向（-b 输出到 stdout），
     用 -o 会报 'Can't create JPEG files from other types' 导致提取失败。
     """
-    jpg_path = out_dir / (cr3_path.stem + "_preview.jpg")
+    # 缓存键带 路径+大小+mtime 哈希：相机文件名会跨会话重复（都叫 IMG_XXXX），
+    # 只用 stem 会把上一次的旧预览误当成当前文件的预览。
+    try:
+        st = cr3_path.stat()
+        cache_key = hashlib.md5(
+            f"{cr3_path.resolve()}|{st.st_size}|{st.st_mtime_ns}".encode("utf-8")
+        ).hexdigest()[:12]
+    except OSError:
+        cache_key = "nocache"
+    jpg_path = out_dir / f"{cr3_path.stem}_{cache_key}_preview.jpg"
     if jpg_path.exists() and jpg_path.stat().st_size > 20_000:
         return jpg_path
     exif = find_exiftool()
@@ -192,6 +203,7 @@ class BirdApp(ctk.CTk):
         self.proc: subprocess.Popen | None = None
         self.batch_running = False
         self._cancelled = False
+        self._eta_sec: int | None = None
 
         self._build_layout()
         self._show_batch()  # 默认显示批量页
@@ -332,6 +344,7 @@ class BirdApp(ctk.CTk):
         self._set_nav_enabled(False)  # 扫描中锁定导航，防止切换页面中断选片
         self.batch_running = True
         self._cancelled = False
+        self._eta_sec = None
         self.batch_log.delete("1.0", "end")
         self.progress.set(0)
         self.progress_label.configure(text="0 / 0")
@@ -360,6 +373,8 @@ class BirdApp(ctk.CTk):
             argv.append("--multi-bird")
         if self.settings.get("classify_all"):
             argv.append("--classify-all")
+        if not self.settings.get("use_gpu", True):
+            argv.append("--cpu")
 
         def handle_line(line: str):
             line = line.rstrip()
@@ -374,6 +389,22 @@ class BirdApp(ctk.CTk):
             if m2:
                 cur, tot = int(m2.group(1)), int(m2.group(2))
                 self.after(0, lambda c=cur, t=tot: self._update_progress(c, t, "复制"))
+                return
+            m3 = re.match(r"\[BIRD\]\s+(.*)", line)
+            if m3:
+                self._log(m3.group(1))  # 鸟种概要行：去掉前缀直接显示
+                return
+            m4 = re.match(r"\[ETA\]\s+(\d+)", line)
+            if m4:
+                sec = int(m4.group(1))
+                self.after(0, lambda s=sec: self._set_eta(s))
+                return
+            m5 = re.match(r"\[START\]\s+total=(\d+)\s+backend=(\w+)\s+est=(\d+)", line)
+            if m5:
+                tot, backend, est = int(m5.group(1)), m5.group(2), int(m5.group(3))
+                self.after(0, lambda: self._log(
+                    f"识别后端: {backend}（{'GPU 加速' if backend == 'CUDA' else 'CPU 模式'}）· "
+                    f"共 {tot} 张 · 预计约 {self._format_secs(est)}"))
                 return
             self._log(line)
 
@@ -434,7 +465,22 @@ class BirdApp(ctk.CTk):
     def _update_progress(self, cur: int, tot: int, phase: str = "识别"):
         if tot > 0:
             self.progress.set(cur / tot)
-        self.progress_label.configure(text=f"{phase} {cur} / {tot}")
+        text = f"{phase} {cur} / {tot}"
+        if getattr(self, "_eta_sec", None):
+            text += f" · 剩余约 {self._format_secs(self._eta_sec)}"
+        self.progress_label.configure(text=text)
+
+    def _set_eta(self, seconds: int):
+        self._eta_sec = seconds
+
+    @staticmethod
+    def _format_secs(seconds: int) -> str:
+        seconds = int(seconds)
+        if seconds >= 3600:
+            return f"{seconds // 3600}时{(seconds % 3600) // 60}分"
+        if seconds >= 60:
+            return f"{seconds // 60}分{seconds % 60}秒"
+        return f"{seconds}秒"
 
     def _set_nav_enabled(self, enabled: bool):
         state = "normal" if enabled else "disabled"
@@ -574,7 +620,7 @@ class BirdApp(ctk.CTk):
                 from snipe import detect_birds
                 # 用 GPU 加速识别（onnxruntime-gpu 需手动预加载 NVIDIA 运行库 DLL，否则静默回退 CPU）
                 from gpu_preload import ensure_gpu
-                ensure_gpu()
+                ensure_gpu(force_cpu=not self.settings.get("use_gpu", True))
                 # 用提取出的预览 JPG 识别（比直接读 RAW 快）
                 target = self.current_preview_path or self.current_image_path
                 detector_model, classifier_model = resolve_model_paths()
@@ -789,6 +835,16 @@ class BirdApp(ctk.CTk):
         if self.settings.get("classify_all"):
             self.classify_all_switch.select()
 
+        # GPU 加速开关
+        row_gpu = ctk.CTkFrame(frame, fg_color="transparent")
+        row_gpu.pack(fill="x", pady=8)
+        ctk.CTkLabel(row_gpu, text="", width=150).pack(side="left")
+        self.use_gpu_switch = ctk.CTkSwitch(
+            row_gpu, text="使用 GPU 加速识别（NVIDIA 显卡，关闭则强制 CPU）")
+        self.use_gpu_switch.pack(side="left")
+        if self.settings.get("use_gpu", True):
+            self.use_gpu_switch.select()
+
         # 保存按钮
         def save():
             try:
@@ -805,6 +861,7 @@ class BirdApp(ctk.CTk):
             self.settings["area_weight"] = round(self.area_slider.get(), 2)
             self.settings["multi_bird"] = bool(self.multi_bird_switch.get())
             self.settings["classify_all"] = bool(self.classify_all_switch.get())
+            self.settings["use_gpu"] = bool(self.use_gpu_switch.get())
             # 反查地区代码
             for code, name in REGIONS.items():
                 if name == self.region_var.get():

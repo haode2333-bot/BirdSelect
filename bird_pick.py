@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import shutil
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -83,7 +85,16 @@ def extract_preview(cr3_path: Path, out_dir: Path) -> Path | None:
     if cr3_path.suffix.lower() in (".jpg", ".jpeg", ".png"):
         return cr3_path
 
-    jpg_path = out_dir / (cr3_path.stem + ".jpg")
+    # 缓存键带 路径+大小+mtime 哈希：相机文件名会跨会话重复（都叫 IMG_XXXX），
+    # 只用 stem 会把上一次拍摄的旧预览误当成当前文件的预览，导致识别/打分用错图。
+    try:
+        st = cr3_path.stat()
+        cache_key = hashlib.md5(
+            f"{cr3_path.resolve()}|{st.st_size}|{st.st_mtime_ns}".encode("utf-8")
+        ).hexdigest()[:12]
+    except OSError:
+        cache_key = "nocache"
+    jpg_path = out_dir / f"{cr3_path.stem}_{cache_key}.jpg"
     if jpg_path.exists() and jpg_path.stat().st_size > 20_000:
         return jpg_path
 
@@ -238,6 +249,8 @@ def main():
                         help="一张图出现多种鸟时各归一类（默认只取置信度最高的一只）")
     parser.add_argument("--classify-all", action="store_true",
                         help="只分类不精选：所有识别出的照片都归档，不按 Top N 筛选")
+    parser.add_argument("--cpu", action="store_true",
+                        help="强制使用 CPU（不启用 GPU 加速）")
     args = parser.parse_args()
 
     if not args.scan_dir.is_dir():
@@ -248,15 +261,19 @@ def main():
                  "  macOS: brew install exiftool\n"
                  "  Windows: 下载 exiftool.exe 放 PATH 并改名 exiftool.exe")
 
+    # 关闭 snipe 的 loguru DEBUG/INFO 噪音，只留 ERROR。必须在 import snipe 之前，
+    # 否则 snipe 导入时打的 INFO 也会漏进日志。
+    from gpu_preload import ensure_gpu, suppress_snipe_logging
+    suppress_snipe_logging()
+
     # 延迟 import snipe，方便 --help 在没装 snipe 时也能看
     try:
         from snipe import detect_birds
     except ImportError:
         sys.exit("未安装 snipe-cli。请先: pip install \"snipe-cli[cpu]\" && snipe init")
 
-    # 用 GPU 加速识别（onnxruntime-gpu 需手动预加载 NVIDIA 运行库 DLL，否则静默回退 CPU）
-    from gpu_preload import ensure_gpu
-    ensure_gpu()
+    # GPU 加速：预加载 NVIDIA 运行库 DLL（否则静默回退 CPU）。--cpu 强制走 CPU。
+    backend = ensure_gpu(force_cpu=args.cpu)
 
     # 解析模型路径：优先工具目录下 models/（便携版），否则 %APPDATA%/.snipe/models/
     detector_model, classifier_model = resolve_model_paths()
@@ -297,11 +314,46 @@ def main():
         else:
             print(msg, flush=True)
 
+    def _status(msg: str):
+        """单张概要行：GUI 用 [BIRD] 前缀供桌面端解析，CLI 直接打印。"""
+        if args.gui:
+            print(f"[BIRD] {msg}", flush=True)
+        else:
+            _log(msg)
+
+    # 后端信息 + 起跑预估（GPU 稳态约 1.0s/张，CPU 约 2.5s/张，冷启动另加约 1.5s）
+    est_per = 1.0 if backend == "CUDA" else 2.5
+    _log(f"识别后端: {backend}（{'GPU 加速' if backend == 'CUDA' else 'CPU 模式'}）")
+    if args.gui:
+        print(f"[START] total={total} backend={backend} est={int(total * est_per)}", flush=True)
+
+    # ETA：滚动平均单张耗时（只统计本次实际识别过的图）
+    timings: list[float] = []
+    scan_start = time.perf_counter()
+    last_eta = -1
+
+    # 预取：识别第 i 张时，后台同时提取第 i+1 张的预览，让 GPU 不空等 exiftool
+    prefetch: dict = {}
+    prefetch_thread: threading.Thread | None = None
+
+    def _prefetch(img_path: Path):
+        prefetch["path"] = img_path
+        prefetch["jpg"] = extract_preview(img_path, tmp_dir)
+
     for idx, img in enumerate(image_files, 1):
+        t_img = time.perf_counter()
         if args.gui:
             print(f"[PROGRESS] {idx}/{total}", flush=True)
         elif pbar is not None:
             pbar.update(1)
+
+        # 收拢上一轮预取的预览结果
+        jpg_path = None
+        if prefetch_thread is not None:
+            prefetch_thread.join()
+            if prefetch.get("path") == img:
+                jpg_path = prefetch.get("jpg")
+            prefetch_thread = None
 
         key = str(img.resolve())
         st = img.stat()
@@ -321,8 +373,18 @@ def main():
                     "quality_total": 0.0, "quality_sharpness": 0.0,
                     "quality_exposure": 0.0, "bbox": None}
 
+        # 启动下一张的预览预取（与本次 GPU 识别重叠；下一张若已处理过则白提一次，代价小）
+        if idx < total:
+            prefetch = {}
+            prefetch_thread = threading.Thread(
+                target=_prefetch, args=(image_files[idx],), daemon=True)
+            prefetch_thread.start()
+
+        # 识别目标：有预览用预览（免 rawpy 全解码），否则回退原图（RAW 走 rawpy）
+        target = jpg_path if jpg_path is not None else img
+
         try:
-            detections = detect_with_timeout(img, args.region,
+            detections = detect_with_timeout(target, args.region,
                                              detector_model=detector_model,
                                              classifier_model=classifier_model)
         except Exception as e:
@@ -333,13 +395,14 @@ def main():
             continue
 
         if detections is _SNIPE_TIMEOUT:
-            _log(f"[TIMEOUT] 识别超时跳过 {img.name}（>{SNIPE_TIMEOUT:.0f}s）")
+            _status(f"{idx}/{total} {img.name} → 超时跳过")
             rec = _empty_rec()
             processed[key] = {"sig": sig, "recs": [rec]}
             records.append(rec)
             continue
 
         if not detections:
+            _status(f"{idx}/{total} {img.name} → 未识别")
             rec = _empty_rec()
             processed[key] = {"sig": sig, "recs": [rec]}
             records.append(rec)
@@ -348,10 +411,12 @@ def main():
         # 决定记录哪些鸟：默认取置信度最高的一只；--multi-bird 时全部各归一类
         chosen = list(detections) if args.multi_bird else [max(detections, key=lambda d: d.score)]
 
-        # 提取内嵌 JPG 做画质打分（一张图只提一次，供所有鸟共用）
-        jpg_path = extract_preview(img, tmp_dir)
+        # 若刚才回退到原图识别（无预览），这里再补一次预览用于画质打分
+        if jpg_path is None:
+            jpg_path = extract_preview(img, tmp_dir)
 
         recs = []
+        summary = []
         for d in chosen:
             rec = {"path": key, "sig": sig,
                    "bird": d.bird_name,
@@ -365,10 +430,10 @@ def main():
                 try:
                     with Image.open(jpg_path) as pil:
                         pil.load()
-                        # snipe 的 bbox 是基于它内部解码图的像素坐标
-                        # 按比例映射到内嵌 JPG（两者分辨率应一致，这里仍做归一化保险）
-                        sx = pil.width / d.image_width
-                        sy = pil.height / d.image_height
+                        # snipe bbox 基于识别图的像素坐标；识别图即预览 JPG 时比例=1，
+                        # 回退原图(RAW)时按比例映射到预览
+                        sx = pil.width / d.image_width if d.image_width else 1.0
+                        sy = pil.height / d.image_height if d.image_height else 1.0
                         mapped = (
                             int(d.bbox.left * sx), int(d.bbox.top * sy),
                             int(d.bbox.right * sx), int(d.bbox.bottom * sy),
@@ -381,9 +446,21 @@ def main():
                 except Exception as e:
                     _log(f"[WARN] 画质打分失败 {img.name}: {e}")
             recs.append(rec)
+            summary.append(f"{d.bird_name} {d.score:.0%}")
+
+        _status(f"{idx}/{total} {img.name} → {'、'.join(summary)}")
 
         processed[key] = {"sig": sig, "recs": recs}
         records.extend(recs)
+
+        # 计时 + ETA（GUI 每变化 >5s 输出一次）
+        timings.append(time.perf_counter() - t_img)
+        if args.gui and len(timings) >= 5:
+            avg = sum(timings) / len(timings)
+            est = int((total - idx) * avg)
+            if abs(est - last_eta) > 5:
+                print(f"[ETA] {est}", flush=True)
+                last_eta = est
 
         # 每 10 张落一次盘，防止中途崩丢进度
         if len(records) % 10 == 0:
@@ -394,6 +471,11 @@ def main():
 
     if pbar is not None:
         pbar.close()
+
+    # 识别阶段耗时统计（供下次预估参考）
+    if timings:
+        avg = sum(timings) / len(timings)
+        _log(f"识别阶段: 平均 {avg:.2f}s/张，共 {time.perf_counter() - scan_start:.0f}s")
 
     # 保存最终状态
     state_file.write_text(
