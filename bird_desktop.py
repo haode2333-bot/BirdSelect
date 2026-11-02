@@ -117,7 +117,7 @@ def save_settings(s: dict):
 # ---------- 工具函数 ----------
 
 def extract_cr3_preview(cr3_path: Path, out_dir: Path) -> Path | None:
-    """从 RAW（CR3/NEF/ARW）提取内嵌全分辨率 JPG 用于显示和识别。
+    """从 RAW（各品牌，如 CR3/NEF/ARW/RAF/ORF/DNG 等）提取内嵌预览 JPG 用于显示和识别。
 
     注意：exiftool 提取二进制 tag 必须用 stdout 重定向（-b 输出到 stdout），
     用 -o 会报 'Can't create JPEG files from other types' 导致提取失败。
@@ -601,8 +601,8 @@ class BirdApp(ctk.CTk):
         header.pack(side="top", fill="x")
         ctk.CTkLabel(header, text="单张识别 · 图鉴对比 · 人工标注",
                      font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(5, 5))
-        ctk.CTkButton(header, text="选择鸟片 (CR3/NEF/ARW/JPG)", command=self._pick_single_image,
-                      height=36).pack(pady=5)
+        ctk.CTkButton(header, text="选择鸟片 (CR3/CR2/NEF/ARW/RAF/RW2/ORF/DNG/JPG)",
+                      command=self._pick_single_image, height=36).pack(pady=5)
 
         # 中部：左右对比区（可伸缩，空间不足时优先压缩这里）
         compare = ctk.CTkFrame(outer, fg_color="transparent")
