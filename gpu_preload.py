@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""GPU 加速预加载 + snipe 日志降噪。
+"""GPU 加速预加载 + snipe 日志降噪 + 后端检测。
 
-观鸟工具用 onnxruntime-gpu 做识别，但 onnxruntime 的 CUDA provider 依赖的
-NVIDIA 运行库（cublas/cudnn/cudart 等）装在 site-packages/nvidia/*/bin 目录下，
-不在 Windows 的 DLL 搜索路径里。不手动调用 onnxruntime.preload_dlls() 的话，
-onnxruntime 会静默回退到 CPU（识别照常，但速度没提升）。snipe 自身不会调这个，
-所以在这里补上。
+后端自动选择：
+  - Windows/NVIDIA：onnxruntime-gpu + CUDA。CUDA provider 依赖的 NVIDIA 运行库
+    （cublas/cudnn/cudart）装在 site-packages/nvidia/*/bin，不在 DLL 搜索路径，
+    需手动 onnxruntime.preload_dlls()，否则静默回退 CPU。
+  - macOS Apple Silicon：CoreMLExecutionProvider（走 ANE/Metal 加速），无需预加载。
+  - 其他：CPU。
 
 用法：在 snipe 导入之后、首次 detect_birds 之前调用 ensure_gpu() 即可。
 """
@@ -32,27 +33,51 @@ def suppress_snipe_logging():
         pass
 
 
+def detect_backend(force_cpu: bool = False) -> str:
+    """返回当前可用的最快推理后端名：'CUDA' / 'CoreML' / 'CPU'。"""
+    if force_cpu:
+        return "CPU"
+    try:
+        import onnxruntime as ort
+        providers = ort.get_available_providers()
+        if "CUDAExecutionProvider" in providers:
+            return "CUDA"
+        if "CoreMLExecutionProvider" in providers:
+            return "CoreML"
+    except Exception:
+        pass
+    return "CPU"
+
+
 def ensure_gpu(force_cpu: bool = False) -> str:
-    """预加载 NVIDIA 运行库 DLL，让识别真正走 CUDA。返回当前后端名 'CUDA' / 'CPU'。
+    """预加载 NVIDIA 运行库 DLL（Windows），让识别真正走 CUDA。返回后端名。
 
     - 成功加载 CUDA DLL 且 CUDA EP 可用 → 'CUDA'
-    - 无显卡 / 加载失败 / force_cpu=True → 'CPU'（识别功能不受影响）
+    - Apple Silicon 有 CoreML EP → 'CoreML'（ANE/Metal，无需预加载）
+    - 无加速 / 加载失败 / force_cpu=True → 'CPU'（识别功能不受影响）
     """
     global _preloaded, _backend
     if _preloaded:
         return _backend
 
-    backend = "CPU"
-    if not force_cpu:
+    backend = detect_backend(force_cpu)
+    if backend == "CUDA":
         try:
-            import onnxruntime as ort  # noqa: PLC0415
+            import onnxruntime as ort
             if "CUDAExecutionProvider" in ort.get_available_providers():
                 ort.preload_dlls()
-                backend = "CUDA"
         except Exception:
-            # 没装 GPU 运行库 / 无显卡 / 加载失败时，回退 CPU
             backend = "CPU"
 
     _backend = backend
     _preloaded = True
     return backend
+
+
+def backend_label(backend: str) -> str:
+    """后端名 → 给用户看的中文标签。"""
+    return {
+        "CUDA": "GPU 加速（NVIDIA CUDA）",
+        "CoreML": "GPU 加速（Apple Silicon / Metal）",
+        "CPU": "CPU 模式",
+    }.get(backend, backend)

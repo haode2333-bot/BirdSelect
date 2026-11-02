@@ -34,8 +34,10 @@ from PIL import Image, ImageTk
 
 # 同目录模块
 from bird_guide import BirdGuide, get_guide
-from exif_rename import read_exif, format_datetime, build_new_name
-from toolpaths import app_dir, find_exiftool, resolve_model_paths, no_window_flags
+from rename_engine import (read_exif, format_datetime, build_fields, render_name,
+                           PRESETS, apply_rename)
+from toolpaths import (app_dir, find_exiftool, resolve_model_paths, no_window_flags,
+                       extract_thumb_via_rawpy, is_raw)
 
 
 # ---------- 全局配置 ----------
@@ -57,6 +59,13 @@ DEFAULT_SETTINGS = {
     "multi_bird": False,        # 一张图多种鸟时是否各归一类
     "classify_all": False,      # 只分类不精选（不按 Top N 筛选）
     "use_gpu": True,            # 是否启用 GPU 加速（关闭则强制 CPU）
+    # ---- EXIF 模板化重命名 ----
+    "rename_preset": "简洁归档",  # 命名预设：简洁归档/上传图鉴/保留相机序号
+    "rename_mode": "copy",       # copy=复制重命名(默认,保护原RAW) / inplace=原地重命名
+    "rename_dir": "",            # 复制模式的目标目录（空=源目录下 renamed/）
+    "location": "",              # 拍摄地点（模板 {loc} 用；留空读 GPS，读不到→UnknownLoc）
+    "custom_template": "",       # 自定义模板（非空时覆盖预设）
+    "burst_detect": True,        # 连拍识别（佳能原生标签 / 其余品牌时间+相似度）
 }
 
 REGIONS = {
@@ -142,6 +151,14 @@ def extract_cr3_preview(cr3_path: Path, out_dir: Path) -> Path | None:
             except OSError:
                 continue
             return jpg_path
+
+    # 跨品牌兜底：exiftool 取不到时用 rawpy（libraw），富士/奥林巴斯等也适用
+    thumb = extract_thumb_via_rawpy(cr3_path)
+    if thumb and len(thumb) > 5_000:
+        try:
+            jpg_path.write_bytes(thumb)
+        except OSError:
+            pass
     return jpg_path if jpg_path.exists() else None
 
 
@@ -209,23 +226,32 @@ class BirdApp(ctk.CTk):
         self._show_batch()  # 默认显示批量页
 
     def _apply_window_geometry(self):
-        """窗口按屏幕工作区（排除任务栏）自适应，避免底部按钮被任务栏挡住。"""
+        """窗口按屏幕工作区（排除任务栏/菜单栏）自适应，避免底部按钮被挡。"""
         try:
-            import ctypes
+            if os.name == "nt":
+                import ctypes
 
-            class RECT(ctypes.Structure):
-                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+                class RECT(ctypes.Structure):
+                    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
-            rect = RECT()
-            # SPI_GETWORKAREA = 0x0030：屏幕工作区（不含任务栏）
-            ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)
-            wa_w = rect.right - rect.left
-            wa_h = rect.bottom - rect.top
-            w = max(900, int(wa_w * 0.8))
-            h = max(600, int(wa_h * 0.8))
-            x = rect.left + (wa_w - w) // 2
-            y = rect.top + (wa_h - h) // 2
+                rect = RECT()
+                # SPI_GETWORKAREA = 0x0030：屏幕工作区（不含任务栏）
+                ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)
+                wa_w = rect.right - rect.left
+                wa_h = rect.bottom - rect.top
+                w = max(900, int(wa_w * 0.8))
+                h = max(600, int(wa_h * 0.8))
+                x = rect.left + (wa_w - w) // 2
+                y = rect.top + (wa_h - h) // 2
+            else:
+                # macOS / Linux：用 tk 的屏幕尺寸，无 ctypes.windll
+                sw = self.winfo_screenwidth()
+                sh = self.winfo_screenheight()
+                w = max(900, int(sw * 0.8))
+                h = max(600, int(sh * 0.8))
+                x = (sw - w) // 2
+                y = (sh - h) // 2
             self.geometry(f"{w}x{h}+{x}+{y}")
         except Exception:
             self.geometry("1200x800")
@@ -329,6 +355,12 @@ class BirdApp(ctk.CTk):
             self.batch_out_dir.delete(0, "end")
             self.batch_out_dir.insert(0, d)
 
+    def _pick_rename_dir(self):
+        d = filedialog.askdirectory(title="选择复制目标目录")
+        if d:
+            self.rename_dir_entry.delete(0, "end")
+            self.rename_dir_entry.insert(0, d)
+
     def _start_batch(self):
         scan_dir = self.batch_scan_dir.get().strip()
         out_dir = self.batch_out_dir.get().strip()
@@ -375,6 +407,8 @@ class BirdApp(ctk.CTk):
             argv.append("--classify-all")
         if not self.settings.get("use_gpu", True):
             argv.append("--cpu")
+        if not self.settings.get("burst_detect", True):
+            argv.append("--no-burst-detect")
 
         def handle_line(line: str):
             line = line.rstrip()
@@ -518,7 +552,9 @@ class BirdApp(ctk.CTk):
         self.btn_identify = ctk.CTkButton(btn_row, text="🔍 开始识别", command=self._identify_single,
                                           height=36, width=150)
         self.btn_identify.pack(side="left", padx=5)
-        self.btn_rename = ctk.CTkButton(btn_row, text="✏️ 执行重命名", command=self._do_rename,
+        _rename_btn_text = ("✏️ 复制重命名" if self.settings.get("rename_mode", "copy") == "copy"
+                            else "✏️ 原地重命名")
+        self.btn_rename = ctk.CTkButton(btn_row, text=_rename_btn_text, command=self._do_rename,
                                         height=36, width=150, state="disabled")
         self.btn_rename.pack(side="left", padx=5)
 
@@ -578,7 +614,12 @@ class BirdApp(ctk.CTk):
     def _pick_single_image(self):
         path = filedialog.askopenfilename(
             title="选择鸟片",
-            filetypes=[("鸟片", "*.CR3 *.cr3 *.NEF *.nef *.ARW *.arw *.jpg *.jpeg *.png"), ("所有文件", "*.*")]
+            filetypes=[("鸟片 (RAW/JPG)",
+                        "*.CR3 *.cr3 *.CR2 *.cr2 *.NEF *.nef *.NRW *.nrw "
+                        "*.ARW *.arw *.SR2 *.sr2 *.RAF *.raf *.RW2 *.rw2 "
+                        "*.ORF *.orf *.PEF *.pef *.DNG *.dng *.RWL *.rwl "
+                        "*.jpg *.jpeg *.png *.JPG *.JPEG *.PNG"),
+                       ("所有文件", "*.*")]
         )
         if not path:
             return
@@ -589,7 +630,7 @@ class BirdApp(ctk.CTk):
         preview_dir = APP_DIR / ".tmp_preview"
         preview_dir.mkdir(exist_ok=True)
 
-        if self.current_image_path.suffix.lower() in (".cr3", ".nef", ".arw"):
+        if is_raw(self.current_image_path):
             self.single_img_label.configure(text="正在提取 RAW 预览…")
             self.update()
             prev = extract_cr3_preview(self.current_image_path, preview_dir)
@@ -711,50 +752,62 @@ class BirdApp(ctk.CTk):
         self.btn_rename.configure(state="normal")
         self._update_rename_preview()
 
+    def _current_template(self) -> str:
+        custom = (self.settings.get("custom_template") or "").strip()
+        if custom:
+            return custom
+        return PRESETS.get(self.settings.get("rename_preset"), PRESETS["简洁归档"])
+
     def _update_rename_preview(self):
         if not self.current_result or not self.current_result.get("bird"):
             self.rename_label.configure(text="")
             return
         bird = self.current_result["bird"]
         sex = self.sex_var.get()
-        dt = self.current_result.get("datetime") or "未知时间"
-        stem = self.current_image_path.stem
-        ext = self.current_image_path.suffix
         if sex and sex != "不标注":
-            name = f"{bird}_{sex}_{dt}_{stem}{ext}"
-        else:
-            name = f"{bird}_{dt}_{stem}{ext}"
-        self.rename_label.configure(text=name)
+            bird = f"{bird}_{sex}"
+        exif = self.current_result.get("exif", {})
+        fields = build_fields(exif, bird=bird,
+                              latin=self.current_result.get("latin"),
+                              loc=self.settings.get("location") or None,
+                              burst=1, seq=1,
+                              orig_name=self.current_image_path.name)
+        name = render_name(self._current_template(), fields)
+        mode = "复制" if self.settings.get("rename_mode", "copy") == "copy" else "原地"
+        self.rename_label.configure(text=f"{name}   [{mode}]")
 
     def _do_rename(self):
         if not self.current_image_path or not self.current_result:
             return
         bird = self.current_result["bird"]
         sex = self.sex_var.get()
-        dt = self.current_result.get("datetime")
-
-        # 构造新文件名
-        parts = [bird]
         if sex and sex != "不标注":
-            parts.append(sex)
-        if dt:
-            parts.append(dt)
-        parts.append(self.current_image_path.stem)
-        new_name = "_".join(parts) + self.current_image_path.suffix
-        new_path = self.current_image_path.with_name(new_name)
+            bird = f"{bird}_{sex}"
+        exif = self.current_result.get("exif", {})
+        fields = build_fields(exif, bird=bird,
+                              latin=self.current_result.get("latin"),
+                              loc=self.settings.get("location") or None,
+                              burst=1, seq=1,
+                              orig_name=self.current_image_path.name)
+        new_name = render_name(self._current_template(), fields)
+        mode = self.settings.get("rename_mode", "copy")
+        rename_dir = Path(self.settings["rename_dir"]) if self.settings.get("rename_dir") else None
 
-        if new_path == self.current_image_path:
-            messagebox.showinfo("提示", "文件名无需修改")
-            return
-
-        if new_path.exists():
-            messagebox.showerror("错误", f"目标已存在:\n{new_path}")
-            return
-
-        if messagebox.askyesno("确认重命名", f"重命名为:\n{new_name}"):
-            self.current_image_path.rename(new_path)
-            messagebox.showinfo("完成", f"已重命名:\n{new_path.name}")
-            self.current_image_path = new_path
+        if mode == "inplace":
+            if not messagebox.askyesno(
+                    "确认原地重命名",
+                    f"将把原文件改名为:\n{new_name}\n\n原地重命名会改动原始 RAW，确认继续？"):
+                return
+            result = apply_rename(self.current_image_path, new_name,
+                                  mode="inplace", dry_run=False)
+            if result:
+                messagebox.showinfo("完成", f"已重命名:\n{result.name}")
+                self.current_image_path = result
+        else:
+            result = apply_rename(self.current_image_path, new_name,
+                                  mode="copy", rename_dir=rename_dir, dry_run=False)
+            if result:
+                messagebox.showinfo("完成", f"已复制为新文件（原文件未动）:\n{result}")
 
     # ---------- 设置页 ----------
 
@@ -845,6 +898,63 @@ class BirdApp(ctk.CTk):
         if self.settings.get("use_gpu", True):
             self.use_gpu_switch.select()
 
+        # ---------- EXIF 重命名 ----------
+        ctk.CTkLabel(frame, text="EXIF 重命名", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(20, 6))
+
+        row_rp = ctk.CTkFrame(frame, fg_color="transparent")
+        row_rp.pack(fill="x", pady=8)
+        ctk.CTkLabel(row_rp, text="命名预设:", width=150).pack(side="left")
+        self.rename_preset_var = ctk.StringVar(value=self.settings.get("rename_preset", "简洁归档"))
+        self.rename_preset_menu = ctk.CTkOptionMenu(
+            row_rp, variable=self.rename_preset_var, values=list(PRESETS.keys()))
+        self.rename_preset_menu.pack(side="left")
+
+        row_rt = ctk.CTkFrame(frame, fg_color="transparent")
+        row_rt.pack(fill="x", pady=8)
+        ctk.CTkLabel(row_rt, text="自定义模板:", width=150).pack(side="left")
+        self.custom_template_entry = ctk.CTkEntry(
+            row_rt, placeholder_text="如 {bird}_{date}_{orig}{ext}（留空用预设）")
+        self.custom_template_entry.pack(side="left", fill="x", expand=True, padx=5)
+        if self.settings.get("custom_template"):
+            self.custom_template_entry.insert(0, self.settings["custom_template"])
+
+        row_rm = ctk.CTkFrame(frame, fg_color="transparent")
+        row_rm.pack(fill="x", pady=8)
+        ctk.CTkLabel(row_rm, text="", width=150).pack(side="left")
+        self.rename_mode_switch = ctk.CTkSwitch(
+            row_rm, text="原地重命名（默认关闭=复制重命名，保护原始 RAW）")
+        self.rename_mode_switch.pack(side="left")
+        if self.settings.get("rename_mode") == "inplace":
+            self.rename_mode_switch.select()
+
+        row_rd = ctk.CTkFrame(frame, fg_color="transparent")
+        row_rd.pack(fill="x", pady=8)
+        ctk.CTkLabel(row_rd, text="复制目标目录:", width=150).pack(side="left")
+        self.rename_dir_entry = ctk.CTkEntry(row_rd, placeholder_text="留空=源目录下 renamed/")
+        self.rename_dir_entry.pack(side="left", fill="x", expand=True, padx=5)
+        if self.settings.get("rename_dir"):
+            self.rename_dir_entry.insert(0, self.settings["rename_dir"])
+        ctk.CTkButton(row_rd, text="浏览", width=60,
+                      command=self._pick_rename_dir).pack(side="left")
+
+        row_loc = ctk.CTkFrame(frame, fg_color="transparent")
+        row_loc.pack(fill="x", pady=8)
+        ctk.CTkLabel(row_loc, text="拍摄地点:", width=150).pack(side="left")
+        self.location_entry = ctk.CTkEntry(row_loc, placeholder_text="模板 {loc} 用，留空读 GPS（读不到→UnknownLoc）")
+        self.location_entry.pack(side="left", fill="x", expand=True, padx=5)
+        if self.settings.get("location"):
+            self.location_entry.insert(0, self.settings["location"])
+
+        # 连拍识别开关
+        row_bd = ctk.CTkFrame(frame, fg_color="transparent")
+        row_bd.pack(fill="x", pady=8)
+        ctk.CTkLabel(row_bd, text="", width=150).pack(side="left")
+        self.burst_detect_switch = ctk.CTkSwitch(
+            row_bd, text="连拍识别（佳能原生标签 / 其余品牌按时间+相似度分组）")
+        self.burst_detect_switch.pack(side="left")
+        if self.settings.get("burst_detect", True):
+            self.burst_detect_switch.select()
+
         # 保存按钮
         def save():
             try:
@@ -867,6 +977,13 @@ class BirdApp(ctk.CTk):
                 if name == self.region_var.get():
                     self.settings["region"] = code
                     break
+            # EXIF 重命名设置
+            self.settings["rename_preset"] = self.rename_preset_var.get()
+            self.settings["custom_template"] = self.custom_template_entry.get().strip()
+            self.settings["rename_mode"] = "inplace" if self.rename_mode_switch.get() else "copy"
+            self.settings["rename_dir"] = self.rename_dir_entry.get().strip()
+            self.settings["location"] = self.location_entry.get().strip()
+            self.settings["burst_detect"] = bool(self.burst_detect_switch.get())
             save_settings(self.settings)
             messagebox.showinfo("已保存", "设置已保存")
 

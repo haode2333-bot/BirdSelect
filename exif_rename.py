@@ -1,163 +1,146 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-exif_rename.py — 读 EXIF 拍摄时间，结合鸟种名自动重命名。
+exif_rename.py — EXIF 模板化重命名 CLI。
 
-命名规则：
-  {鸟种名}_{YYYYMMDD_HHMM}_{原文件名}.CR3
-  例：凤头鹰_20260815_1632_ABC0001.CR3
+基于 rename_engine（模板/预设/复制/原地）+ burst_group（连拍分组）。
 
 用法：
-  # 单个文件（识别结果作为 --bird 参数传入）
-  python exif_rename.py photo.CR3 --bird 凤头鹰
+  # 单个文件（识别结果作为 --bird 传入）
+  python exif_rename.py photo.CR3 --bird 灰背鸫 --preset 简洁归档 --dry-run
 
-  # 批量：读 bird_picks/bird_index.csv，按索引重命名已复制的精选片
-  python exif_rename.py --from-index bird_picks/bird_index.csv
+  # 批量：读 bird_index.csv，按鸟种分组 → 连拍分组 → 模板重命名
+  python exif_rename.py --from-index bird_picks/bird_index.csv --preset 上传图鉴
 
-  # dry-run 先看效果
-  python exif_rename.py photo.CR3 --bird 凤头鹰 --dry-run
+  # 自定义模板 + 指定复制目标目录
+  python exif_rename.py --from-index bird_index.csv --template "{bird}_{date}_{orig}{ext}" --rename-dir ./out
+
+模式：
+  --mode copy    复制重命名（默认，保护原始 RAW，原文件不动）
+  --mode inplace 原地重命名（移动原文件，慎用）
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import json
-import re
-import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
-from typing import Optional
 
-from toolpaths import no_window_flags
-
-
-# ---------- EXIF 读取 ----------
-
-def read_exif(path: Path) -> dict:
-    """用 exiftool 读关键 EXIF 字段，返回 dict。"""
-    # 一次取出所有需要的字段，JSON 输出便于解析
-    cmd = [
-        "exiftool", "-j",
-        "-DateTimeOriginal",
-        "-CreateDate",
-        "-GPSLatitude",
-        "-GPSLongitude",
-        "-Make",
-        "-Model",
-        "-LensModel",
-        "-ISO",
-        "-FNumber",
-        "-ExposureTime",
-        str(path),
-    ]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
-                           creationflags=no_window_flags())
-    except subprocess.TimeoutExpired:
-        return {}
-    if r.returncode != 0 or not r.stdout.strip():
-        return {}
-    try:
-        data = json.loads(r.stdout)
-        return data[0] if data else {}
-    except (json.JSONDecodeError, IndexError):
-        return {}
+from rename_engine import (PRESETS, PLACEHOLDERS, build_fields, read_exif,
+                           render_name, apply_rename, validate_template)
+from burst_group import group_bursts
 
 
-def format_datetime(exif: dict) -> Optional[str]:
-    """从 EXIF 里取拍摄时间，格式化为 YYYYMMDD_HHMM。"""
-    raw = exif.get("DateTimeOriginal") or exif.get("CreateDate")
-    if not raw:
-        return None
-    # exiftool 格式: "2026:08:15 16:32:45"
-    m = re.match(r"(\d{4}):(\d{2}):(\d{2})\s+(\d{2}):(\d{2})", str(raw))
-    if not m:
-        return None
-    y, mo, d, h, mi = m.groups()
-    return f"{y}{mo}{d}_{h}{mi}"
-
-
-# ---------- 重命名 ----------
-
-def build_new_name(bird_name: str, datetime_str: Optional[str], original_name: str) -> str:
-    """构造新文件名，保留原扩展名。"""
-    p = Path(original_name)
-    stem = p.stem
-    ext = p.suffix
-    parts = []
-    if bird_name:
-        parts.append(sanitize(bird_name))
-    if datetime_str:
-        parts.append(datetime_str)
-    parts.append(stem)
-    return "_".join(parts) + ext
-
-
-def sanitize(name: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]', "_", name.strip())
-
-
-def rename_file(path: Path, bird_name: str, dry_run: bool = False) -> Optional[Path]:
-    """重命名单个文件，返回新路径（dry-run 也返回预期新路径）。"""
+def _rename_one(path: Path, bird: str | None, latin: str | None,
+                template: str, mode: str, rename_dir: Path | None,
+                loc: str | None, burst: int | None, seq: int | None,
+                num: int | None, dry_run: bool) -> Path | None:
     exif = read_exif(path)
-    dt = format_datetime(exif)
-    new_name = build_new_name(bird_name, dt, path.name)
-    new_path = path.with_name(new_name)
-
-    if new_path == path:
-        return path
-
-    if dry_run:
-        print(f"[dry-run] {path.name}  →  {new_name}")
-        return new_path
-
-    if new_path.exists():
-        print(f"[SKIP] 目标已存在: {new_path.name}", file=sys.stderr)
-        return None
-
-    path.rename(new_path)
-    print(f"[OK] {path.name}  →  {new_name}")
-    return new_path
+    fields = build_fields(exif, bird=bird, latin=latin, loc=loc,
+                          burst=burst, seq=seq, num=num, orig_name=path.name)
+    new_name = render_name(template, fields)
+    return apply_rename(path, new_name, mode=mode, rename_dir=rename_dir,
+                        dry_run=dry_run)
 
 
-# ---------- 批量模式 ----------
-
-def rename_from_index(index_csv: Path, dry_run: bool = False):
-    """读 bird_index.csv，对里面 copied_to 列的文件重命名。"""
+def rename_from_index(index_csv: Path, template: str, mode: str,
+                      rename_dir: Path | None, loc: str | None,
+                      dry_run: bool, no_burst: bool = False) -> int:
+    """读 bird_index.csv，按鸟种 → 连拍分组 → 模板重命名。返回重命名文件数。"""
     if not index_csv.exists():
         sys.exit(f"索引文件不存在: {index_csv}")
 
     with index_csv.open(encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
+        rows = list(csv.DictReader(f))
+
+    # 按鸟种聚合（copied_to 为实际落盘文件）
+    by_bird: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        bird = (row.get("bird") or "").strip()
+        copied = row.get("copied_to") or ""
+        if not copied:
+            continue
+        key = bird or "未知鸟"
+        by_bird[key].append(row)
 
     renamed = 0
-    for row in rows:
-        copied = row.get("copied_to", "")
-        bird = row.get("bird", "")
-        if not copied or not Path(copied).exists():
+    for bird, items in sorted(by_bird.items()):
+        files = []
+        for row in items:
+            p = Path(row["copied_to"])
+            if p.exists():
+                files.append(p)
+        if not files:
             continue
-        result = rename_file(Path(copied), bird, dry_run=dry_run)
-        if result is not None:
-            renamed += 1
+        # 连拍分组：优先用 CSV 已标注的 burst_group/burst_seq，否则现场计算
+        have_burst_cols = bool(items) and all(
+            ("burst_group" in row and "burst_seq" in row) for row in items)
+        bursts = {}
+        if not have_burst_cols and not no_burst:
+            bursts = group_bursts(files)
+        num = 0
+        for row in items:
+            p = Path(row["copied_to"])
+            if not p.exists():
+                continue
+            if no_burst:
+                g, s = 1, 1
+            elif have_burst_cols:
+                try:
+                    g = int(row.get("burst_group") or 1)
+                    s = int(row.get("burst_seq") or 1)
+                except (TypeError, ValueError):
+                    g, s = 1, 1
+            else:
+                g, s, _m = bursts.get(str(p.resolve()), (1, 1, "time_similarity"))
+            num += 1
+            result = _rename_one(p, bird if bird != "未知鸟" else None,
+                                 row.get("species_code") or None,
+                                 template, mode, rename_dir, loc, g, s, num, dry_run)
+            if result is not None:
+                renamed += 1
 
-    print(f"\n处理完成，{renamed} 个文件 {'（dry-run 未实际改名）' if dry_run else '已重命名'}")
+    print(f"\n处理完成，{renamed} 个文件 "
+          f"{'（dry-run 未实际改动）' if dry_run else ('已复制' if mode == 'copy' else '已重命名')}")
+    return renamed
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="读 EXIF 拍摄时间，结合鸟种名重命名文件",
+        description="EXIF 模板化重命名（复制/原地），支持连拍分组",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("file", nargs="?", type=Path, help="要重命名的单个文件")
     parser.add_argument("--bird", help="鸟种名（单个文件模式）")
     parser.add_argument("--from-index", type=Path, help="从 bird_index.csv 批量重命名")
-    parser.add_argument("--dry-run", action="store_true", help="只打印不实际改名")
+    parser.add_argument("--preset", choices=list(PRESETS.keys()), help="命名预设")
+    parser.add_argument("--template", help="自定义模板（覆盖 --preset），如 {bird}_{date}_{orig}{ext}")
+    parser.add_argument("--mode", choices=["copy", "inplace"], default="copy",
+                        help="copy=复制重命名(默认,不动原文件) / inplace=原地重命名")
+    parser.add_argument("--rename-dir", type=Path, help="复制模式的目标目录（默认 源目录/renamed）")
+    parser.add_argument("--location", help="拍摄地点（模板 {loc} 用，读不到 GPS 时兜底）")
+    parser.add_argument("--no-burst", action="store_true",
+                        help="关闭连拍分组（全部记为 组1/序1）")
+    parser.add_argument("--dry-run", action="store_true", help="只打印不实际改名/复制")
     args = parser.parse_args()
 
+    if args.template:
+        template = args.template
+        bad = validate_template(template)
+        if bad:
+            sys.exit(f"模板含未知占位符: {bad}。可用占位符: "
+                     f"{', '.join('{'+p+'}' for p in PLACEHOLDERS)}")
+    elif args.preset:
+        template = PRESETS[args.preset]
+    else:
+        template = PRESETS["简洁归档"]
+
     if args.from_index:
-        rename_from_index(args.from_index, dry_run=args.dry_run)
+        rename_from_index(args.from_index, template, args.mode,
+                          args.rename_dir, args.location, args.dry_run,
+                          args.no_burst)
         return
 
     if not args.file:
@@ -168,20 +151,17 @@ def main():
 
     exif = read_exif(args.file)
     print(f"文件: {args.file.name}")
-    print(f"  拍摄时间: {exif.get('DateTimeOriginal', '未知')}")
+    dt = exif.get("DateTimeOriginal") or exif.get("CreateDate")
+    print(f"  拍摄时间: {dt or '未知'}")
     print(f"  相机: {exif.get('Make', '')} {exif.get('Model', '')}")
-    print(f"  镜头: {exif.get('LensModel', '未知')}")
-    if exif.get("GPSLatitude"):
-        print(f"  GPS: {exif.get('GPSLatitude')}, {exif.get('GPSLongitude')}")
-    print(f"  ISO: {exif.get('ISO', '?')}  "
-          f"光圈: f/{exif.get('FNumber', '?')}  "
-          f"快门: {exif.get('ExposureTime', '?')}")
-
-    result = rename_file(args.file, args.bird or "未识别", dry_run=args.dry_run)
+    fields = build_fields(exif, bird=args.bird, loc=args.location,
+                          burst=1, seq=1, orig_name=args.file.name)
+    print(f"  新文件名: {render_name(template, fields)}")
+    result = _rename_one(args.file, args.bird, None, template, args.mode,
+                         args.rename_dir, args.location, 1, 1, 1, args.dry_run)
     if result and not args.dry_run:
-        print(f"\n新文件: {result}")
+        print(f"\n结果: {result}")
 
 
 if __name__ == "__main__":
     main()
-#（注：内容由AI生成）

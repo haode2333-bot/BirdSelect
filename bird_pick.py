@@ -39,7 +39,9 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from toolpaths import find_exiftool, resolve_model_paths, no_window_flags
+from toolpaths import (find_exiftool, resolve_model_paths, no_window_flags,
+                       SCAN_GLOBS, extract_thumb_via_rawpy)
+from burst_group import group_bursts
 
 
 # ---------- 工具函数 ----------
@@ -119,6 +121,17 @@ def extract_preview(cr3_path: Path, out_dir: Path) -> Path | None:
             except OSError:
                 continue
             return jpg_path
+
+    # 跨品牌兜底：exiftool 的 JpgFromRaw/PreviewImage 都失败（富士 RAF/奥林巴斯 ORF
+    # 等标签名不一）时，用 rawpy（libraw）统一提取内嵌缩略图。Apple Silicon 上是
+    # 原生 arm64 构建，比 exiftool（perl）快，且内存占用有界（只取缩略图不全解码）。
+    thumb = extract_thumb_via_rawpy(cr3_path)
+    if thumb and len(thumb) > 5_000:
+        try:
+            jpg_path.write_bytes(thumb)
+        except OSError:
+            return None
+        return jpg_path
 
     return None
 
@@ -207,6 +220,27 @@ def detect_with_timeout(img: Path, region: str, language: str = "CN",
     return box.get("result")
 
 
+# ---------- 预览缓存清理（内存/磁盘保护） ----------
+
+def prune_preview_cache(tmp_dir: Path, max_files: int = 300) -> None:
+    """预览缓存目录最多保留 max_files 个文件，超出按修改时间删最旧。
+
+    批量跑移动硬盘时，几十张 RAW 的内嵌预览会同时占临时盘与后续加载的内存；
+    限制缓存文件数，防止一次性加载过多预览导致卡死/内存吃满（Apple Silicon
+    统一内存架构尤其敏感）。
+    """
+    try:
+        files = sorted(tmp_dir.glob("*.jpg"), key=lambda p: p.stat().st_mtime)
+        if len(files) > max_files:
+            for f in files[: len(files) - max_files]:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
 # ---------- 主流程 ----------
 
 def main():
@@ -220,11 +254,11 @@ def main():
         sys.exit(f"缺少依赖: {e}\n请先: pip install pillow numpy opencv-python-headless tqdm")
 
     parser = argparse.ArgumentParser(
-        description="扫描 RAW（CR3/NEF/ARW）与 JPG 鸟片，按物种自动选 Top N 高质量片",
+        description="扫描 RAW（CR3/CR2/NEF/ARW/RAF/RW2/ORF/DNG 等）与 JPG 鸟片，按物种自动选 Top N 高质量片",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--scan-dir", type=Path, required=True,
-                        help="移动硬盘上鸟图根目录（递归扫描 *.CR3/*.NEF/*.ARW/*.JPG/*.PNG）")
+                        help="移动硬盘上鸟图根目录（递归扫描各品牌 RAW 与 JPG/PNG）")
     parser.add_argument("--output-dir", type=Path, required=True,
                         help="精选结果输出目录（会建在移动硬盘或内置盘均可）")
     parser.add_argument("--top-n", type=int, default=3,
@@ -251,6 +285,12 @@ def main():
                         help="只分类不精选：所有识别出的照片都归档，不按 Top N 筛选")
     parser.add_argument("--cpu", action="store_true",
                         help="强制使用 CPU（不启用 GPU 加速）")
+    parser.add_argument("--read-gap", type=float, default=0.0,
+                        help="每张之间额外停顿秒数（移动硬盘休眠保护，0=不启用）")
+    parser.add_argument("--max-preview-cache", type=int, default=300,
+                        help="预览缓存最多保留文件数，超出删最旧（内存/磁盘保护）")
+    parser.add_argument("--no-burst-detect", action="store_true",
+                        help="关闭连拍分组（默认开启：佳能原生标签 / 其余品牌时间+相似度）")
     args = parser.parse_args()
 
     if not args.scan_dir.is_dir():
@@ -263,7 +303,7 @@ def main():
 
     # 关闭 snipe 的 loguru DEBUG/INFO 噪音，只留 ERROR。必须在 import snipe 之前，
     # 否则 snipe 导入时打的 INFO 也会漏进日志。
-    from gpu_preload import ensure_gpu, suppress_snipe_logging
+    from gpu_preload import ensure_gpu, suppress_snipe_logging, backend_label
     suppress_snipe_logging()
 
     # 延迟 import snipe，方便 --help 在没装 snipe 时也能看
@@ -290,11 +330,9 @@ def main():
     if args.resume and state_file.exists():
         processed = json.loads(state_file.read_text(encoding="utf-8"))
 
-    # 扫描所有图片（RAW 与 JPG/PNG，大小写都兼容：佳能 CR3 / 尼康 NEF / 索尼 ARW）
-    exts = ("*.CR3", "*.cr3", "*.NEF", "*.nef", "*.ARW", "*.arw",
-            "*.JPG", "*.jpg", "*.JPEG", "*.jpeg", "*.PNG", "*.png")
+    # 扫描所有图片（RAW 与 JPG/PNG，大小写都兼容，覆盖佳能/尼康/索尼/富士/松下/奥林巴斯/宾得/徕卡）
     image_files = []
-    for ext in exts:
+    for ext in SCAN_GLOBS:
         image_files.extend(args.scan_dir.rglob(ext))
     image_files = sorted(set(image_files))
     print(f"找到 {len(image_files)} 个图片文件，区域过滤={args.region}，"
@@ -321,9 +359,9 @@ def main():
         else:
             _log(msg)
 
-    # 后端信息 + 起跑预估（GPU 稳态约 1.0s/张，CPU 约 2.5s/张，冷启动另加约 1.5s）
-    est_per = 1.0 if backend == "CUDA" else 2.5
-    _log(f"识别后端: {backend}（{'GPU 加速' if backend == 'CUDA' else 'CPU 模式'}）")
+    # 后端信息 + 起跑预估（GPU/CoreML 稳态约 1.0s/张，CPU 约 2.5s/张，冷启动另加约 1.5s）
+    est_per = 1.0 if backend in ("CUDA", "CoreML") else 2.5
+    _log(f"识别后端: {backend_label(backend)}")
     if args.gui:
         print(f"[START] total={total} backend={backend} est={int(total * est_per)}", flush=True)
 
@@ -346,6 +384,14 @@ def main():
             print(f"[PROGRESS] {idx}/{total}", flush=True)
         elif pbar is not None:
             pbar.update(1)
+
+        # 移动硬盘休眠保护：可选的每张间隔停顿，降低长时间连续读取导致硬盘频繁启停/发热
+        if args.read_gap > 0:
+            time.sleep(args.read_gap)
+
+        # 每 20 张清理一次预览缓存，避免预览堆积吃满内存/临时盘
+        if idx % 20 == 0:
+            prune_preview_cache(tmp_dir, args.max_preview_cache)
 
         # 收拢上一轮预取的预览结果
         jpg_path = None
@@ -571,12 +617,35 @@ def main():
                 shutil.copy2(src, dst)
             _tick_copy()
 
+    # ---------- 连拍分组标注 ----------
+    # 默认开启：佳能读原生标签（BurstUUID 等），其余品牌走「时间+图像相似度」；
+    # --no-burst-detect 关闭时全部记为 组1/序1。
+    if args.no_burst_detect:
+        for row in csv_rows:
+            row["burst_group"] = 1
+            row["burst_seq"] = 1
+    else:
+        files_by_bird: dict[str, list[Path]] = defaultdict(list)
+        for row in csv_rows:
+            p = Path(row["copied_to"])
+            if p.exists():
+                files_by_bird[row["bird"]].append(p)
+        burst_cache: dict[str, tuple[int, int]] = {}
+        for _bird, flist in files_by_bird.items():
+            for k, (g, s, _m) in group_bursts(flist).items():
+                burst_cache[k] = (g, s)
+        for row in csv_rows:
+            p = Path(row["copied_to"])
+            g, s = burst_cache.get(str(p.resolve()), (1, 1))
+            row["burst_group"] = g
+            row["burst_seq"] = s
+
     # ---------- 写 CSV ----------
     csv_path = args.output_dir / "bird_index.csv"
     with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
         fields = ["rank", "bird", "species_code", "source_cr3", "copied_to",
                   "detection_conf", "quality_total", "quality_sharpness",
-                  "quality_exposure"]
+                  "quality_exposure", "burst_group", "burst_seq"]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(csv_rows)

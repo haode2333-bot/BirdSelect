@@ -1,3 +1,6 @@
 snipe-cli[cpu]
 opencv-python-headless
 customtkinter
+pillow
+numpy
+rawpy
