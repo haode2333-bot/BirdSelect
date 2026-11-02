@@ -1017,12 +1017,6 @@ class BirdApp(ctk.CTk):
 
         ctk.CTkButton(frame, text="保存设置", command=save, height=36).pack(pady=20)
 
-        # 图鉴库信息
-        ctk.CTkLabel(frame, text=f"图鉴库: 已收录 {len(self.guide)} 种鸟",
-                     text_color="gray").pack(pady=5)
-        ctk.CTkLabel(frame, text=f"图鉴目录: {GALLERY_DIR}",
-                     text_color="gray", font=ctk.CTkFont(size=11)).pack()
-
     # ---------- 导航高亮 ----------
 
     def _highlight_nav(self, active_btn):
