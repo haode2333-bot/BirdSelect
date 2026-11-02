@@ -72,6 +72,8 @@ python bird_desktop.py        # Windows
 - **内存保护**：批量处理串行 + 预览缓存限量（`--max-preview-cache`），不会一次加载几十张 RAW 吃满统一内存
 - **硬盘休眠保护**：长时间跑移动硬盘时可用 `--read-gap` 加间隔停顿，减少硬盘频繁启停/发热
 
+> 完整的 macOS 运行与打包步骤（含 .app 构建、CoreML 验证）见 [docs/MAC_BUILD.md](docs/MAC_BUILD.md)。
+
 ## 命令行
 
 批量扫描：
