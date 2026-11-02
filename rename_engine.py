@@ -51,6 +51,7 @@ PRESETS: dict[str, str] = {
     "简洁归档": "{datetime}_{bird}_连拍组{burst}_序号{seq}{ext}",
     "上传图鉴": "{bird}_{date}_{loc}_序号{num}{ext}",
     "保留相机序号": "{orig}_{bird}_{date}{ext}",
+    "保持原文件名": "{orig}{ext}",
 }
 
 # 所有合法占位符（{ext} 若未出现在模板里会自动补在末尾）

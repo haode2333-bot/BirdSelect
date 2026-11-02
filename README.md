@@ -109,6 +109,7 @@ python exif_rename.py --from-index bird_index.csv --dry-run
 | 简洁归档 | `{datetime}_{bird}_连拍组{burst}_序号{seq}{ext}` | `20261102_153020_灰背鸫_连拍组001_序号02.CR3` |
 | 上传图鉴 | `{bird}_{date}_{loc}_序号{num}{ext}` | `灰背鸫_20261102_深圳南山_序号01.CR3` |
 | 保留相机序号 | `{orig}_{bird}_{date}{ext}` | `DSC01234_黑脸噪鹛_20261102.CR3` |
+| 保持原文件名 | `{orig}{ext}` | `IMG_0076.CR3` |
 
 可用占位符：`{date}` `{time}` `{datetime}` `{bird}` `{latin}` `{loc}` `{burst}` `{seq}` `{num}` `{orig}` `{model}` `{ext}`。
 
