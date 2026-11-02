@@ -361,6 +361,20 @@ class BirdApp(ctk.CTk):
             self.rename_dir_entry.delete(0, "end")
             self.rename_dir_entry.insert(0, d)
 
+    def _update_preset_preview(self):
+        """设置页里按当前预设/自定义模板/地点渲染一个命名示例，实时预览。"""
+        if not hasattr(self, "rename_preset_preview"):
+            return
+        custom = self.custom_template_var.get().strip()
+        preset = self.rename_preset_var.get()
+        tpl = custom or PRESETS.get(preset, PRESETS["简洁归档"])
+        exif = {"DateTimeOriginal": "2026:11:02 15:30:20", "SubSecTimeOriginal": 20,
+                "Make": "Canon", "Model": "EOS R8"}
+        loc = self.location_var.get().strip() or "深圳南山"
+        fields = build_fields(exif, bird="灰背鸫", latin="Turdus hortulorum",
+                              loc=loc, burst=1, seq=2, num=1, orig_name="DSC01234.CR3")
+        self.rename_preset_preview.configure(text=f"示例: {render_name(tpl, fields)}")
+
     def _start_batch(self):
         scan_dir = self.batch_scan_dir.get().strip()
         out_dir = self.batch_out_dir.get().strip()
@@ -909,14 +923,22 @@ class BirdApp(ctk.CTk):
             row_rp, variable=self.rename_preset_var, values=list(PRESETS.keys()))
         self.rename_preset_menu.pack(side="left")
 
+        # 命名预览示例（随预设/模板/地点实时刷新）
+        row_rprev = ctk.CTkFrame(frame, fg_color="transparent")
+        row_rprev.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(row_rprev, text="", width=150).pack(side="left")
+        self.rename_preset_preview = ctk.CTkLabel(
+            row_rprev, text="", text_color="gray", anchor="w", font=ctk.CTkFont(size=12))
+        self.rename_preset_preview.pack(side="left", padx=5, fill="x", expand=True)
+
         row_rt = ctk.CTkFrame(frame, fg_color="transparent")
         row_rt.pack(fill="x", pady=8)
         ctk.CTkLabel(row_rt, text="自定义模板:", width=150).pack(side="left")
+        self.custom_template_var = ctk.StringVar(value=self.settings.get("custom_template", ""))
         self.custom_template_entry = ctk.CTkEntry(
-            row_rt, placeholder_text="如 {bird}_{date}_{orig}{ext}（留空用预设）")
+            row_rt, textvariable=self.custom_template_var,
+            placeholder_text="如 {bird}_{date}_{orig}{ext}（留空用预设）")
         self.custom_template_entry.pack(side="left", fill="x", expand=True, padx=5)
-        if self.settings.get("custom_template"):
-            self.custom_template_entry.insert(0, self.settings["custom_template"])
 
         row_rm = ctk.CTkFrame(frame, fg_color="transparent")
         row_rm.pack(fill="x", pady=8)
@@ -940,10 +962,10 @@ class BirdApp(ctk.CTk):
         row_loc = ctk.CTkFrame(frame, fg_color="transparent")
         row_loc.pack(fill="x", pady=8)
         ctk.CTkLabel(row_loc, text="拍摄地点:", width=150).pack(side="left")
-        self.location_entry = ctk.CTkEntry(row_loc, placeholder_text="模板 {loc} 用，留空读 GPS（读不到→UnknownLoc）")
+        self.location_var = ctk.StringVar(value=self.settings.get("location", ""))
+        self.location_entry = ctk.CTkEntry(row_loc, textvariable=self.location_var,
+                                           placeholder_text="模板 {loc} 用，留空读 GPS（读不到→UnknownLoc）")
         self.location_entry.pack(side="left", fill="x", expand=True, padx=5)
-        if self.settings.get("location"):
-            self.location_entry.insert(0, self.settings["location"])
 
         # 连拍识别开关
         row_bd = ctk.CTkFrame(frame, fg_color="transparent")
@@ -954,6 +976,12 @@ class BirdApp(ctk.CTk):
         self.burst_detect_switch.pack(side="left")
         if self.settings.get("burst_detect", True):
             self.burst_detect_switch.select()
+
+        # 命名预览示例：预设/模板/地点一改就刷新
+        self.rename_preset_var.trace_add("write", lambda *_: self._update_preset_preview())
+        self.custom_template_var.trace_add("write", lambda *_: self._update_preset_preview())
+        self.location_var.trace_add("write", lambda *_: self._update_preset_preview())
+        self._update_preset_preview()
 
         # 保存按钮
         def save():
